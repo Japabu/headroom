@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var icon = IconState(lit: 0, core: .hollow)
     private var refillTimer: Timer?
     private var appearanceObservation: NSKeyValueObservation?
+    private var drawnDark: Bool?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -16,8 +17,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.target = self
             button.action = #selector(togglePopover(_:))
+            // Setting the button's image or title fires this observer again with the same
+            // appearance, so redraw only when light/dark really flips. Otherwise it loops.
             appearanceObservation = button.observe(\.effectiveAppearance) { [weak self] _, _ in
-                DispatchQueue.main.async { self?.draw() }
+                DispatchQueue.main.async {
+                    guard let self, let button = self.statusItem?.button, self.isDark(button) != self.drawnDark else { return }
+                    self.draw()
+                }
             }
         }
 
@@ -42,7 +48,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func draw(refillLit: Int? = nil) {
         guard let button = statusItem?.button else { return }
-        let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let dark = isDark(button)
+        drawnDark = dark
         button.image = SparkImage.make(icon, refillLit: refillLit, dark: dark)
         if let text = icon.text, refillLit == nil {
             var attributes: [NSAttributedString.Key: Any] = [
@@ -58,6 +65,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.imagePosition = .imageOnly
         }
         button.toolTip = icon.tooltip
+    }
+
+    private func isDark(_ button: NSStatusBarButton) -> Bool {
+        button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 
     /// The rays light up one after another twice, then the icon settles.
