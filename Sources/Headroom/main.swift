@@ -28,24 +28,26 @@ MainActor.assumeIsolated {
 
 /// Command-line checks. Neither one renews logins or posts notifications.
 enum Diagnostics {
-    /// `Headroom --dump`: what Headroom finds and reads, without tokens.
+    /// `Headroom --dump`: which account each Claude Code slot holds and its usage, without tokens.
+    /// Doesn't renew or save anything.
     static func dump() {
-        let accounts = Discovery.accounts(extraDirs: UserDefaults.standard.stringArray(forKey: "extraConfigDirs") ?? [])
-        print("Found \(accounts.count) Claude Code login(s)")
+        let slots = Discovery.slots(extraDirs: UserDefaults.standard.stringArray(forKey: "extraConfigDirs") ?? [])
+        print("Found \(slots.count) Claude Code login slot(s)")
         let now = Date()
-        for a in accounts {
-            let activity = Discovery.activity(a.configDir)
-            print("\n\(a.item.service)")
-            print("  folder:  \(a.configDir?.path ?? "unknown")")
-            print("  email:   \(Discovery.email(a.globalConfig) ?? "unknown")")
+        for slot in slots {
+            let activity = Discovery.activity(slot.configDir)
+            print("\n\(slot.item.service)")
+            print("  folder:  \(slot.configDir?.path ?? "unknown")")
             print("  running: \(activity.running) Claude Code session(s), last activity \(activity.last.map { Fmt.when($0, now: now) } ?? "none")")
             let done = DispatchSemaphore(value: 0)
             var outcome = Fetcher.Outcome()
             Task.detached {
-                outcome = await Fetcher.run(item: a.item, claudeRunning: activity.running > 0, renewAllowed: false, wantEmail: false)
+                outcome = await Fetcher.run(.slot(slot, claudeRunning: activity.running > 0), known: nil,
+                                            renewAllowed: false, keepCopy: false)
                 done.signal()
             }
             done.wait()
+            print("  account: \(outcome.identity?.email ?? "unknown")\(outcome.identity?.org.map { " (\($0))" } ?? "")")
             print("  plan:    \(outcome.plan ?? "unknown")")
             if let issue = outcome.issue { print("  issue:   \(issue.message)") }
             for w in outcome.usage?.all ?? [] {

@@ -31,25 +31,22 @@ This builds `Headroom.app`, copies it to `~/Applications`, and starts it. It als
 
 ## Multiple accounts
 
-Claude Code keeps one login per config folder. Give each extra account its own folder:
+Log in to each account once with `/login` in Claude Code. Headroom notices which account each login belongs to and remembers it. It keeps a copy of the login in the keychain, so it can keep tracking an account after you `/login` to a different one. If that copy stops working, for example after `/logout`, the account stays in the menu with its last known numbers and reset times.
 
-```sh
-alias claude-work='CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude'
-```
-
-Run `claude-work` once and type `/login` with the other account. Headroom finds it within a minute. **Add account…** in the menu walks you through this and can add the alias to `~/.zshrc` for you.
+Separate config folders (`CLAUDE_CONFIG_DIR`) work too. Headroom picks up the login in each one.
 
 ## Where the data comes from
 
 - **Usage numbers:** Anthropic's `api.anthropic.com/api/oauth/usage` endpoint, the same one Claude Code's `/usage` uses. The numbers include claude.ai and the desktop app, not only Claude Code.
 - **Logins:** the macOS Keychain entries Claude Code already created. Headroom reads them through `/usr/bin/security`, the same way Claude Code does, so there are no keychain prompts.
-- **Which account is in use:** whichever config folder Claude Code was active in most recently, from its `sessions/` folder and `history.jsonl`.
+- **Whose login it is:** `api.anthropic.com/api/oauth/profile`, asked once each time a login's token changes.
+- **Which account is in use:** the one logged in where Claude Code was active most recently, from its `sessions/` folder and `history.jsonl`.
 
-Headroom checks the account in use every 2 minutes and the others every 10 minutes. It has no server and no analytics. The only other network requests are to Anthropic: one to look up an account's email if Claude Code hasn't saved it, and one to renew an expired login.
+Headroom checks the account in use every 2 minutes and the others every 10 minutes. It has no server and no analytics. The only other network request is to Anthropic, to renew an expired login.
 
 ### Expired logins
 
-Claude Code renews its own login when you use it. For an account you haven't used in a while, Headroom renews the login and saves it back where Claude Code keeps it. It does this only when no Claude Code session is open for that account, so it never competes with a running session for the same token. You can turn this off in Settings.
+Claude Code renews its own login when you use it. For an account you haven't used in a while, Headroom renews the login and saves it back where it came from. It never renews a login that Claude Code is currently logged in to while a Claude Code session is open, and it only uses its own saved copy for accounts Claude Code is no longer logged in to, so it never competes with Claude Code for the same token. You can turn renewing off in Settings.
 
 ## Troubleshooting
 

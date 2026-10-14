@@ -119,44 +119,27 @@ enum LoginItem {
 }
 
 /// Last known numbers per account, so a restart shows something right away and an
-/// account with an expired login still shows when it resets.
+/// account you're no longer logged in to still shows when it resets.
 struct CachedAccount: Codable {
     var usage: Usage?
     var email: String?
     var plan: String?
+    var org: String?
+    var signedOut: Bool?
 }
 
 enum Cache {
-    private static let key = "cache.v1"
+    // v1 was keyed by keychain slot, which mixed up accounts after a /login. v2 is keyed by account.
+    private static let key = "cache.v2"
 
     static func load() -> [String: CachedAccount] {
+        UserDefaults.standard.removeObject(forKey: "cache.v1")
         guard let data = UserDefaults.standard.data(forKey: key) else { return [:] }
         return (try? JSONDecoder().decode([String: CachedAccount].self, from: data)) ?? [:]
     }
 
     static func save(_ cache: [String: CachedAccount]) {
         if let data = try? JSONEncoder().encode(cache) { UserDefaults.standard.set(data, forKey: key) }
-    }
-}
-
-enum ShellConfig {
-    /// Appends an alias line to ~/.zshrc unless an alias with that name is already there.
-    static func appendAlias(_ line: String, name: String) -> Bool {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".zshrc")
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        if existing.contains("alias \(name)=") { return true }
-        let addition = (existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n") + "\n# Claude account for Headroom\n\(line)\n"
-        guard let handle = try? FileHandle(forWritingTo: url) else {
-            return (try? addition.write(to: url, atomically: true, encoding: .utf8)) != nil
-        }
-        defer { try? handle.close() }
-        do {
-            try handle.seekToEnd()
-            try handle.write(contentsOf: Data(addition.utf8))
-            return true
-        } catch {
-            return false
-        }
     }
 }
 
@@ -172,9 +155,12 @@ enum Fmt {
         f.setLocalizedDateFormatFromTemplate("EEEjmm")
         return f
     }()
+    /// "21 Oct 13:00". The combined template would add "at", which wraps in the menu.
     private static let dateTime: DateFormatter = {
         let f = DateFormatter()
-        f.setLocalizedDateFormatFromTemplate("dMMMjmm")
+        let day = DateFormatter.dateFormat(fromTemplate: "dMMM", options: 0, locale: .current) ?? "d MMM"
+        let time = DateFormatter.dateFormat(fromTemplate: "jmm", options: 0, locale: .current) ?? "HH:mm"
+        f.dateFormat = day + " " + time
         return f
     }()
     private static let weekday: DateFormatter = {

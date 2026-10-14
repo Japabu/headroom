@@ -1,20 +1,25 @@
 import AppKit
 import Combine
 
+/// One Claude account Headroom has seen, whether or not Claude Code is logged in to it right now.
 struct AccountState: Identifiable {
-    var account: Account
-    var label = ""
+    var id: String
     var email: String?
+    var org: String?
     var plan: String?
     var usage: Usage?
     var issue: AccountIssue?
+    /// Its saved login stopped working; only last known numbers are left.
+    var signedOut = false
+    var label = ""
+
+    /// The Claude Code slot that holds this login right now, if any.
+    var slot: String?
     var lastActivity: Date?
     var runningSessions = 0
     var nextFetch = Date.distantPast
     var failures = 0
     var fetching = false
-
-    var id: String { account.id }
 }
 
 struct ResetRow: Identifiable {
@@ -22,6 +27,18 @@ struct ResetRow: Identifiable {
     var account: String
     var what: String
     var id: String { "\(account)|\(date.timeIntervalSince1970)" }
+}
+
+/// A Claude Code login slot and the account it was holding when last read.
+private struct SlotState {
+    var slot: LoginSlot
+    var activity = Discovery.Activity(last: nil, running: 0)
+    var identity: Identity?
+    var fingerprint: String?
+    var issue: AccountIssue?
+    var nextFetch = Date.distantPast
+    var failures = 0
+    var fetching = false
 }
 
 @MainActor
@@ -39,28 +56,36 @@ final class AppModel: ObservableObject {
     var onOpenRequest: (() -> Void)?
 
     private let notifier = Notifier()
-    private var cache = Cache.load()
+    private var records: [String: AccountState] = [:]
+    private var slots: [String: SlotState] = [:]
     private var timer: Timer?
     private var lastDiscovery = Date.distantPast
     private var discovering = false
     private var handledResets = Set<String>()
     private var bag = Set<AnyCancellable>()
-    private var allowRenew = true
+    private var quiet = false
 
-    var isRefreshing: Bool { accounts.contains { $0.fetching } }
+    var isRefreshing: Bool { slots.values.contains { $0.fetching } || records.values.contains { $0.fetching } }
     var inUse: AccountState? { accounts.first { $0.id == inUseID } }
 
-    /// `quiet` is for snapshots: no notifications, no login renewals.
+    init() {
+        for (key, c) in Cache.load() {
+            records[key] = AccountState(id: key, email: c.email, org: c.org, plan: c.plan, usage: c.usage, signedOut: c.signedOut ?? false)
+        }
+        publish()
+    }
+
+    /// `quiet` is for snapshots: no notifications, no renewals, no saved logins.
     func start(quiet: Bool = false) {
+        self.quiet = quiet
         if quiet {
             notifier.enabled = false
-            allowRenew = false
         } else {
             notifier.onOpen = { [weak self] in self?.onOpenRequest?() }
             notifier.setup()
         }
         settings.objectWillChange
-            .sink { [weak self] _ in DispatchQueue.main.async { self?.settingsChanged() } }
+            .sink { [weak self] _ in DispatchQueue.main.async { self?.publish() } }
             .store(in: &bag)
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshAll() }
@@ -83,31 +108,27 @@ final class AppModel: ObservableObject {
     func popoverWillOpen() {
         openCount += 1
         now = Date()
-        if let i = accounts.firstIndex(where: { $0.id == inUseID }),
-           now.timeIntervalSince(accounts[i].usage?.fetchedAt ?? .distantPast) > 60 {
-            accounts[i].nextFetch = .distantPast
+        if let key = inUseID, now.timeIntervalSince(records[key]?.usage?.fetchedAt ?? .distantPast) > 60 {
+            fetchSoon(key, at: now)
         }
         fetchDue()
     }
 
     func refreshAll() {
-        for i in accounts.indices { accounts[i].nextFetch = .distantPast }
+        for key in slots.keys { slots[key]?.nextFetch = .distantPast }
+        for key in records.keys { records[key]?.nextFetch = .distantPast }
         lastDiscovery = .distantPast
         tick()
     }
 
-    // MARK: Discovery
+    // MARK: Slots and accounts
 
     private func discover() {
         discovering = true
         lastDiscovery = Date()
         let extra = UserDefaults.standard.stringArray(forKey: "extraConfigDirs") ?? []
-        let known = Set(accounts.filter { $0.email != nil }.map(\.id))
         Task.detached(priority: .utility) {
-            let found = Discovery.accounts(extraDirs: extra).map { a in
-                Discovery.Found(account: a, activity: Discovery.activity(a.configDir),
-                                email: known.contains(a.id) ? nil : Discovery.email(a.globalConfig))
-            }
+            let found = Discovery.slots(extraDirs: extra).map { Discovery.Found(slot: $0, activity: Discovery.activity($0.configDir)) }
             await MainActor.run { self.apply(found) }
         }
     }
@@ -115,129 +136,189 @@ final class AppModel: ObservableObject {
     private func apply(_ found: [Discovery.Found]) {
         discovering = false
         discovered = true
-        var next: [AccountState] = []
+        var next: [String: SlotState] = [:]
         for f in found {
-            var s = accounts.first { $0.id == f.account.id } ?? newState(f.account)
-            s.account = f.account
-            if let e = f.email { s.email = e }
-            s.lastActivity = f.activity.last
-            s.runningSessions = f.activity.running
-            next.append(s)
+            var s = slots[f.slot.id] ?? SlotState(slot: f.slot)
+            s.slot = f.slot
+            s.activity = f.activity
+            next[f.slot.id] = s
         }
-        let previous = inUseID
-        inUseID = next.max { ($0.lastActivity ?? .distantPast) < ($1.lastActivity ?? .distantPast) }?.id
-        if inUseID != previous, let i = next.firstIndex(where: { $0.id == inUseID }) {
-            next[i].nextFetch = min(next[i].nextFetch, Date())
-        }
-        accounts = next
-        applyLabels()
+        slots = next
+        remap()
         fetchDue()
-        publishIcon()
     }
 
-    private func newState(_ account: Account) -> AccountState {
-        var s = AccountState(account: account)
-        if let c = cache[account.id] {
-            s.usage = c.usage
-            s.email = c.email
-            s.plan = c.plan
+    /// Ties each account to the slot holding it now, and picks the account in use:
+    /// the one in the slot Claude Code was active in most recently.
+    private func remap() {
+        for key in records.keys {
+            records[key]?.slot = nil
+            records[key]?.lastActivity = nil
+            records[key]?.runningSessions = 0
         }
-        return s
+        var best: (key: String, last: Date)?
+        for (service, s) in slots {
+            guard let key = s.identity?.key, records[key] != nil else { continue }
+            records[key]?.slot = service
+            records[key]?.runningSessions += s.activity.running
+            let last = s.activity.last ?? .distantPast
+            if last > (records[key]?.lastActivity ?? .distantPast) { records[key]?.lastActivity = last }
+            if best == nil || last > best!.last { best = (key, last) }
+        }
+        inUseID = best?.key
+        publish()
     }
 
-    private func applyLabels() {
-        for i in accounts.indices {
-            let s = accounts[i]
-            let custom = settings.labels[s.id].flatMap { $0.isEmpty ? nil : $0 }
-            accounts[i].label = custom ?? Discovery.defaultLabel(s.account, email: s.email)
+    private func publish() {
+        var list = Array(records.values)
+        for i in list.indices {
+            let custom = settings.labels[list[i].id].flatMap { $0.isEmpty ? nil : $0 }
+            let name = list[i].email.flatMap { $0.split(separator: "@").first.map(String.init) }
+            list[i].label = custom ?? name ?? "Claude account"
         }
         let inUse = inUseID
-        accounts.sort { a, b in
-            let ka = a.id == inUse ? 0 : 1, kb = b.id == inUse ? 0 : 1
-            if ka != kb { return ka < kb }
+        func rank(_ a: AccountState) -> Int { a.id == inUse ? 0 : (a.slot != nil ? 1 : 2) }
+        list.sort { a, b in
+            if rank(a) != rank(b) { return rank(a) < rank(b) }
             return a.label.localizedCaseInsensitiveCompare(b.label) == .orderedAscending
         }
+        accounts = list
+        publishIcon()
     }
 
-    private func settingsChanged() {
-        applyLabels()
-        publishIcon()
+    private func save() {
+        Cache.save(records.mapValues {
+            CachedAccount(usage: $0.usage, email: $0.email, plan: $0.plan, org: $0.org, signedOut: $0.signedOut)
+        })
     }
 
     // MARK: Fetching
 
     private func fetchDue() {
         let t = Date()
-        for s in accounts where !s.fetching && s.nextFetch <= t { fetch(s.id) }
+        for (service, s) in slots where !s.fetching && s.nextFetch <= t { fetchSlot(service) }
+
+        // Saved copies are used only while every slot is known to hold some other account.
+        // That way Headroom never renews a login that Claude Code is still using.
+        let settled = slots.values.allSatisfy { !$0.fetching && ($0.identity != nil || $0.issue == .notLoggedIn) }
+        guard settled else { return }
+        for (key, r) in records where r.slot == nil && !r.signedOut && !r.fetching && r.nextFetch <= t { fetchCopy(key) }
     }
 
-    private func fetch(_ id: String) {
-        guard let i = accounts.firstIndex(where: { $0.id == id }) else { return }
-        accounts[i].fetching = true
-        let s = accounts[i]
-        let renew = settings.renewLogins && allowRenew
+    private func fetchSlot(_ service: String) {
+        guard let s = slots[service] else { return }
+        slots[service]?.fetching = true
+        publish()
+        let known = s.identity.flatMap { id in s.fingerprint.map { (fingerprint: $0, identity: id) } }
+        let renew = settings.renewLogins && !quiet
+        let keep = !quiet
         Task {
-            let outcome = await Fetcher.run(item: s.account.item, claudeRunning: s.runningSessions > 0,
-                                            renewAllowed: renew, wantEmail: s.email == nil)
-            self.finish(id, outcome)
+            let o = await Fetcher.run(.slot(s.slot, claudeRunning: s.activity.running > 0), known: known,
+                                      renewAllowed: renew, keepCopy: keep)
+            self.finishSlot(service, o)
         }
     }
 
-    private func finish(_ id: String, _ o: Fetcher.Outcome) {
-        guard let i = accounts.firstIndex(where: { $0.id == id }) else { return }
-        var s = accounts[i]
+    private func finishSlot(_ service: String, _ o: Fetcher.Outcome) {
+        guard var s = slots[service] else { return }
         s.fetching = false
-        if let p = o.plan { s.plan = p }
-        if let e = o.email { s.email = e }
-        if let u = o.usage {
-            s.usage = u
-            s.failures = 0
-            lastUpdated = u.fetchedAt
-        } else {
-            s.failures += 1
-        }
         s.issue = o.issue
-        s.nextFetch = Date().addingTimeInterval(delay(for: s, o))
-        accounts[i] = s
-        cache[id] = CachedAccount(usage: s.usage, email: s.email, plan: s.plan)
-        Cache.save(cache)
-        applyLabels()
+        s.identity = o.identity
+        s.fingerprint = o.identity == nil ? nil : o.fingerprint
+        s.failures = o.usage == nil ? s.failures + 1 : 0
+        if let id = o.identity {
+            var r = records[id.key] ?? AccountState(id: id.key)
+            r.email = id.email ?? r.email
+            r.org = id.org ?? r.org
+            r.signedOut = false
+            take(o, into: &r)
+            records[id.key] = r
+        }
+        s.nextFetch = Date().addingTimeInterval(delay(o, failures: s.failures, inUse: o.identity?.key == inUseID))
+        slots[service] = s
+        afterFetch()
+    }
+
+    private func fetchCopy(_ key: String) {
+        guard let r = records[key] else { return }
+        records[key]?.fetching = true
+        publish()
+        let identity = Identity(key: key, email: r.email, org: r.org)
+        let renew = settings.renewLogins && !quiet
+        Task {
+            let o = await Fetcher.run(.copy(identity), known: nil, renewAllowed: renew)
+            self.finishCopy(key, o)
+        }
+    }
+
+    private func finishCopy(_ key: String, _ o: Fetcher.Outcome) {
+        guard var r = records[key] else { return }
+        r.fetching = false
+        r.failures = o.usage == nil ? r.failures + 1 : 0
+        take(o, into: &r)
+        if o.issue == .signedOut { r.signedOut = true }
+        r.nextFetch = Date().addingTimeInterval(delay(o, failures: r.failures, inUse: false))
+        records[key] = r
+        afterFetch()
+    }
+
+    private func take(_ o: Fetcher.Outcome, into r: inout AccountState) {
+        if let p = o.plan { r.plan = p }
+        if let u = o.usage {
+            r.usage = u
+            lastUpdated = u.fetchedAt
+        }
+        r.issue = o.issue
+    }
+
+    private func afterFetch() {
+        remap()
+        save()
         now = Date()
         checkNotifications()
-        publishIcon()
+        fetchDue()
     }
 
-    private func delay(for s: AccountState, _ o: Fetcher.Outcome) -> TimeInterval {
+    private func delay(_ o: Fetcher.Outcome, failures: Int, inUse: Bool) -> TimeInterval {
         if let r = o.retryAfter { return max(60, r) }
         if o.usage == nil {
             switch o.issue {
             case .rateLimited: return 300
-            case .offline: return min(600, 30 * pow(2, Double(min(s.failures, 5))))
+            case .offline: return min(600, 30 * pow(2, Double(min(failures, 5))))
             case .unreadable: return 900
+            case .signedOut: return 6 * 3600
             default: return 120 // expired or missing login: look again soon, Claude Code may have renewed it
             }
         }
-        return s.id == inUseID ? 120 : 600
+        return inUse ? 120 : 600
+    }
+
+    private func fetchSoon(_ key: String, at t: Date) {
+        if let service = records[key]?.slot, let n = slots[service]?.nextFetch {
+            slots[service]?.nextFetch = min(n, t)
+        } else if let n = records[key]?.nextFetch {
+            records[key]?.nextFetch = min(n, t)
+        }
     }
 
     // MARK: Resets and notifications
 
     private func noticeResets() {
         let t = Date()
-        for i in accounts.indices {
-            guard let u = accounts[i].usage else { continue }
+        for a in accounts {
+            guard let u = a.usage else { continue }
             for w in u.all {
                 guard let r = w.resetsAt, r <= t else { continue }
-                guard handledResets.insert("\(accounts[i].id)|\(w.id)|\(r.timeIntervalSince1970)").inserted else { continue }
-                accounts[i].nextFetch = min(accounts[i].nextFetch, t.addingTimeInterval(20))
+                guard handledResets.insert("\(a.id)|\(w.id)|\(r.timeIntervalSince1970)").inserted else { continue }
+                fetchSoon(a.id, at: t.addingTimeInterval(20))
                 guard w.id == "session", t.timeIntervalSince(r) < 3600 else { continue }
-                let key = Notifier.windowKey(accounts[i].id, r)
+                let key = Notifier.windowKey(a.id, r)
                 let wasTight = w.percent >= 90 || notifier.hasFired("hot|" + key) || notifier.hasFired("limit|" + key)
                 guard wasTight else { continue }
                 if settings.notifyRefill {
-                    notifier.post(key: "refill|" + key, title: "\(accounts[i].label) is refilled", body: "A fresh 5-hour session is ready.")
+                    notifier.post(key: "refill|" + key, title: "\(a.label) is refilled", body: "A fresh 5-hour session is ready.")
                 }
-                if accounts[i].id == inUseID { onRefill?() }
+                if a.id == inUseID { onRefill?() }
             }
         }
     }
@@ -285,9 +366,8 @@ final class AppModel: ObservableObject {
     }
 
     private func publishIcon() {
-        let t = Date()
         let others = accounts.filter { $0.id != inUseID }
-        onIconChange?(IconState.make(for: inUse, others: others, now: t, mode: settings.textMode, discovered: discovered))
+        onIconChange?(IconState.make(for: inUse, others: others, now: Date(), mode: settings.textMode, discovered: discovered))
     }
 
     // MARK: For the menu

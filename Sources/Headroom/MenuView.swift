@@ -7,9 +7,6 @@ final class MenuUIState: ObservableObject {
     @Published var page: MenuView.Page = .main
     @Published var expanded: Set<String> = []
     @Published var hovered: String?
-    @Published var accountName = "work"
-    @Published var addedToShell = false
-    @Published var copied: String?
 }
 
 struct MenuView: View {
@@ -17,14 +14,13 @@ struct MenuView: View {
     @ObservedObject var settings: Settings
     @ObservedObject var ui: MenuUIState
 
-    enum Page { case main, settings, add }
+    enum Page { case main, settings }
 
     var body: some View {
         Group {
             switch ui.page {
             case .main: mainPage
             case .settings: SettingsPage(model: model, settings: settings, ui: ui) { ui.page = .main }
-            case .add: AddAccountPage(ui: ui) { ui.page = .main }
             }
         }
         .frame(width: 340)
@@ -56,11 +52,6 @@ struct MenuView: View {
             Divider()
             HStack(spacing: 0) {
                 FooterButton("Settings…", ui: ui) { ui.page = .settings }
-                FooterButton("Add account…", ui: ui) {
-                    ui.addedToShell = false
-                    ui.copied = nil
-                    ui.page = .add
-                }
                 Spacer()
                 FooterButton("Quit", secondary: true, ui: ui) { NSApp.terminate(nil) }
             }
@@ -130,8 +121,8 @@ private struct AccountCard: View {
     }
 
     @ViewBuilder private var full: some View {
-        if let email = state.email {
-            Text(email).font(.system(size: 11.5)).foregroundStyle(.secondary).padding(.leading, 22).padding(.top, -5)
+        if let caption {
+            Text(caption).font(.system(size: 11.5)).foregroundStyle(.secondary).padding(.leading, 22).padding(.top, -5)
         }
         if let issue = state.issue { IssueView(issue: issue, fetchedAt: state.usage?.fetchedAt, now: now) }
         if let u = state.usage?.at(now) {
@@ -139,6 +130,13 @@ private struct AccountCard: View {
         } else if state.issue == nil {
             Text("Reading usage…").foregroundStyle(.secondary).padding(.leading, 22)
         }
+    }
+
+    private var caption: String? {
+        var parts: [String] = []
+        if let email = state.email, email != state.label { parts.append(email) }
+        if state.slot == nil { parts.append("not logged in to Claude Code") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     @ViewBuilder private var compact: some View {
@@ -298,10 +296,10 @@ private struct NextResetsView: View {
             Text("NEXT RESETS").font(.system(size: 10.5, weight: .semibold)).tracking(0.6).foregroundStyle(.secondary)
             ForEach(rows) { row in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(Fmt.when(row.date, now: now)).fontWeight(.semibold).monospacedDigit()
-                        .frame(width: 74, alignment: .leading)
+                    Text(Fmt.when(row.date, now: now)).fontWeight(.semibold).monospacedDigit().lineLimit(1)
+                        .frame(width: 98, alignment: .leading)
                     Text("in " + Fmt.duration(row.date.timeIntervalSince(now))).font(.system(size: 12)).foregroundStyle(.secondary)
-                        .monospacedDigit().frame(width: 74, alignment: .leading)
+                        .monospacedDigit().lineLimit(1).frame(width: 64, alignment: .leading)
                     Text("\(row.account) · \(row.what)").lineLimit(1).truncationMode(.tail)
                 }
             }
@@ -451,7 +449,7 @@ private struct SettingsPage: View {
                         SectionLabel("Account names")
                         ForEach(model.accounts) { s in
                             VStack(alignment: .leading, spacing: 3) {
-                                TextField(Discovery.defaultLabel(s.account, email: s.email), text: labelBinding(s.id))
+                                TextField(s.email ?? "Claude account", text: labelBinding(s.id))
                                     .textFieldStyle(.roundedBorder)
                                 Text(details(s)).font(.system(size: 11)).foregroundStyle(.secondary)
                                     .lineLimit(1).truncationMode(.middle)
@@ -465,74 +463,12 @@ private struct SettingsPage: View {
     }
 
     private func details(_ s: AccountState) -> String {
-        [s.email, s.account.configDir.map { ($0.path as NSString).abbreviatingWithTildeInPath }]
+        [s.email, s.org, s.slot == nil ? "not logged in to Claude Code" : nil]
             .compactMap { $0 }.joined(separator: " · ")
     }
 
     private func labelBinding(_ id: String) -> Binding<String> {
         Binding(get: { settings.labels[id] ?? "" },
                 set: { settings.labels[id] = $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 })
-    }
-}
-
-private struct AddAccountPage: View {
-    @ObservedObject var ui: MenuUIState
-    let back: () -> Void
-
-    private var slug: String {
-        let mapped = String(ui.accountName.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
-        let trimmed = mapped.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return trimmed.isEmpty ? "work" : trimmed
-    }
-    private var command: String { "claude-\(slug)" }
-    private var alias: String { "alias \(command)='CLAUDE_CONFIG_DIR=\"$HOME/.claude-\(slug)\" claude'" }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            PageHeader(title: "Add account", back: back)
-            Divider()
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Each Claude account gets its own Claude Code folder. Headroom finds it as soon as you log in there.")
-                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Text("Name")
-                    TextField("work", text: $ui.accountName).textFieldStyle(.roundedBorder)
-                        .onChange(of: ui.accountName) { ui.addedToShell = false }
-                }
-                step(1, "Add a shortcut to your shell:")
-                codeBox(alias)
-                Button(ui.addedToShell ? "Added to ~/.zshrc" : "Add it to ~/.zshrc for me") {
-                    ui.addedToShell = ShellConfig.appendAlias(alias, name: command)
-                }
-                .disabled(ui.addedToShell)
-                step(2, "Open a new terminal tab and run:")
-                codeBox(command)
-                step(3, "Type /login and sign in with the other account. It shows up here within a minute.")
-            }
-            .padding(14)
-        }
-    }
-
-    private func step(_ n: Int, _ text: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("\(n)").font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
-            Text(text).fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private func codeBox(_ code: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text(code).font(.system(size: 11.5, design: .monospaced)).textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 4)
-            Button(ui.copied == code ? "Copied" : "Copy") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(code, forType: .string)
-                ui.copied = code
-            }
-            .controlSize(.small)
-        }
-        .padding(8)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
     }
 }

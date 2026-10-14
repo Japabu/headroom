@@ -1,20 +1,21 @@
 import Foundation
 
-struct Account: Identifiable, Hashable {
+/// A place where Claude Code keeps one login: ~/.claude, or a CLAUDE_CONFIG_DIR folder.
+/// Each `/login` replaces whatever account the slot held before.
+struct LoginSlot: Identifiable, Hashable {
     let item: KeychainItem
     var configDir: URL?
     var globalConfig: URL?
 
     var id: String { item.service }
-    var isDefault: Bool { item.service == Keychain.baseService }
 }
 
-/// Finds Claude Code logins and matches each to its config folder.
+/// Finds Claude Code's login slots and what Claude Code is doing in each.
 enum Discovery {
     struct Activity { var last: Date?; var running: Int }
-    struct Found { var account: Account; var activity: Activity; var email: String? }
+    struct Found { var slot: LoginSlot; var activity: Activity }
 
-    static func accounts(extraDirs: [String]) -> [Account] {
+    static func slots(extraDirs: [String]) -> [LoginSlot] {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
         var candidates: [URL] = []
@@ -34,11 +35,11 @@ enum Discovery {
 
         return Keychain.claudeItems().map { item in
             if item.service == Keychain.baseService {
-                return Account(item: item, configDir: home.appendingPathComponent(".claude"),
-                               globalConfig: home.appendingPathComponent(".claude.json"))
+                return LoginSlot(item: item, configDir: home.appendingPathComponent(".claude"),
+                                 globalConfig: home.appendingPathComponent(".claude.json"))
             }
             let dir = bySuffix[String(item.service.suffix(8))]
-            return Account(item: item, configDir: dir, globalConfig: dir?.appendingPathComponent(".claude.json"))
+            return LoginSlot(item: item, configDir: dir, globalConfig: dir?.appendingPathComponent(".claude.json"))
         }
     }
 
@@ -56,27 +57,15 @@ enum Discovery {
         return Activity(last: last, running: running)
     }
 
-    static func email(_ globalConfig: URL?) -> String? {
+    /// The account Claude Code says this slot is logged in to, from its .claude.json.
+    /// Only a fallback: it can lag a moment behind the keychain right after a /login.
+    static func identity(_ globalConfig: URL?) -> Identity? {
         guard let url = globalConfig, let data = try? Data(contentsOf: url),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let account = root["oauthAccount"] as? [String: Any] else { return nil }
-        return account["emailAddress"] as? String
-    }
-
-    /// "Personal" for the plain `claude` login, "Work" for ~/.claude-work, else the email name.
-    static func defaultLabel(_ account: Account, email: String?) -> String {
-        if account.isDefault { return "Personal" }
-        if let dir = account.configDir {
-            var name = dir.lastPathComponent
-            for prefix in [".claude", "claude"] where name.lowercased().hasPrefix(prefix) {
-                name = String(name.dropFirst(prefix.count))
-                break
-            }
-            name = name.trimmingCharacters(in: CharacterSet(charactersIn: "-_. "))
-            if !name.isEmpty { return name.prefix(1).uppercased() + name.dropFirst() }
-        }
-        if let email, let local = email.split(separator: "@").first { return String(local) }
-        return "Account " + account.item.service.suffix(4)
+              let account = root["oauthAccount"] as? [String: Any],
+              let uuid = account["accountUuid"] as? String else { return nil }
+        return Identity(key: "\(uuid)|\(account["organizationUuid"] as? String ?? "")",
+                        email: account["emailAddress"] as? String, org: account["organizationName"] as? String)
     }
 
     private static func modified(_ url: URL) -> Date? {

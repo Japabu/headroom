@@ -37,6 +37,11 @@ struct KeychainItem: Hashable {
 /// keychain never asks for permission.
 enum Keychain {
     static let baseService = "Claude Code-credentials"
+    /// Headroom's own copy of each login it has seen, so an account can still be tracked
+    /// after Claude Code is switched to another one with /login.
+    static let copyService = "Headroom saved login"
+
+    static func copyItem(_ key: String) -> KeychainItem { KeychainItem(service: copyService, account: key) }
     private static let security = "/usr/bin/security"
 
     /// Lists Claude Code logins. Asking only for attributes never shows a keychain prompt.
@@ -116,6 +121,21 @@ struct OAuthCreds {
 
     var expiresSoon: Bool { expiresAt.map { $0 < Date().addingTimeInterval(60) } ?? false }
 
+    /// Changes whenever the access token does, i.e. on every renewal or /login.
+    var fingerprint: String {
+        String(SHA256.hash(data: Data(accessToken.utf8)).map { String(format: "%02x", $0) }.joined().prefix(16))
+    }
+
+    /// The claudeAiOauth fields, in the shape Claude Code stores them.
+    var dictionary: [String: Any] {
+        var d: [String: Any] = ["accessToken": accessToken, "scopes": scopes]
+        if let refreshToken { d["refreshToken"] = refreshToken }
+        if let expiresAt { d["expiresAt"] = Int64(expiresAt.timeIntervalSince1970 * 1000) }
+        if let subscriptionType { d["subscriptionType"] = subscriptionType }
+        if let rateLimitTier { d["rateLimitTier"] = rateLimitTier }
+        return d
+    }
+
     /// "default_claude_max_20x" → "Max 20x", "pro" → "Pro".
     var plan: String? {
         if let tier = rateLimitTier?.lowercased(),
@@ -145,11 +165,16 @@ enum API {
         await send(authorized(usageURL, token), authCodes: [401, 403])
     }
 
-    static func email(token: String) async -> String? {
+    /// Whose login a token is: the account plus the organization, since one person can
+    /// have a personal plan and a team plan with separate limits.
+    static func identity(token: String) async -> Identity? {
         guard case .success(let data) = await send(authorized(profileURL, token), authCodes: [401, 403]),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let account = root["account"] as? [String: Any] else { return nil }
-        return account["email"] as? String
+              let account = root["account"] as? [String: Any],
+              let uuid = account["uuid"] as? String else { return nil }
+        let org = root["organization"] as? [String: Any]
+        return Identity(key: "\(uuid)|\(org?["uuid"] as? String ?? "")",
+                        email: account["email"] as? String, org: org?["name"] as? String)
     }
 
     struct Token: Decodable {
@@ -205,7 +230,7 @@ enum API {
 
 enum AccountIssue: Equatable {
     case expiredClaudeRunning, expiredRenewOff, expiredRenewFailed, notLoggedIn
-    case offline, rateLimited, unreadable, renewNotSaved
+    case offline, rateLimited, unreadable, renewNotSaved, signedOut
 
     var message: String {
         switch self {
@@ -217,6 +242,7 @@ enum AccountIssue: Equatable {
         case .rateLimited: "Anthropic asked Headroom to slow down. Retrying in a few minutes."
         case .unreadable: "The usage reply changed format, so Headroom can't read it. It needs an update."
         case .renewNotSaved: "Renewed the login but couldn't save it. If Claude Code asks you to log in again, run /login."
+        case .signedOut: "This login stopped working, so these are the last known numbers. Log in to this account with /login once to track it again."
         }
     }
 
@@ -228,71 +254,119 @@ enum AccountIssue: Equatable {
         case .rateLimited: "Slowed down, retrying"
         case .unreadable: "Can't read usage"
         case .renewNotSaved: "Login renewed but not saved"
+        case .signedOut: "Last known numbers"
         }
     }
 }
 
-/// One round trip for one account: read its login, renew it if needed and allowed, ask for usage.
+/// Whose login something is. `key` is "accountUUID|organizationUUID".
+struct Identity: Codable, Hashable {
+    var key: String
+    var email: String?
+    var org: String?
+}
+
+/// One round trip for one login: read it, find out whose it is, renew it if needed and
+/// allowed, and ask for usage.
 enum Fetcher {
+    enum Source {
+        /// A Claude Code slot. Claude Code owns this login.
+        case slot(LoginSlot, claudeRunning: Bool)
+        /// Headroom's saved copy of an account that no slot holds anymore.
+        case copy(Identity)
+    }
+
     struct Outcome {
         var usage: Usage?
         var issue: AccountIssue?
         var plan: String?
-        var email: String?
+        var identity: Identity?
+        var fingerprint: String?
         var retryAfter: TimeInterval?
     }
 
-    static func run(item: KeychainItem, claudeRunning: Bool, renewAllowed: Bool, wantEmail: Bool) async -> Outcome {
+    /// `known` is the identity found the last time this slot had the same token, which
+    /// saves asking Anthropic again. `keepCopy` saves the login under Headroom's own entry.
+    static func run(_ source: Source, known: (fingerprint: String, identity: Identity)?,
+                    renewAllowed: Bool, keepCopy: Bool = true) async -> Outcome {
         var out = Outcome()
+        let item: KeychainItem
+        var claudeRunning = false
+        var isCopy = false
+        switch source {
+        case .slot(let slot, let running):
+            item = slot.item
+            claudeRunning = running
+        case .copy(let identity):
+            item = Keychain.copyItem(identity.key)
+            isCopy = true
+            out.identity = identity
+        }
+
         guard let root = Keychain.read(item), var creds = OAuthCreds(root) else {
-            out.issue = .notLoggedIn
+            out.issue = isCopy ? .signedOut : .notLoggedIn
             return out
         }
         out.plan = creds.plan
+        out.fingerprint = creds.fingerprint
+        if out.identity == nil, let known, known.fingerprint == creds.fingerprint { out.identity = known.identity }
+
         // Never renew under a running Claude Code: it holds the same refresh token, and a
         // renewal here would invalidate it. Claude Code renews on its own when it's used.
         let canRenew = renewAllowed && !claudeRunning && creds.refreshToken != nil
-        let expiredIssue: AccountIssue = claudeRunning ? .expiredClaudeRunning : (renewAllowed ? .expiredRenewFailed : .expiredRenewOff)
-        var renewed = false
+        let expiredIssue: AccountIssue = claudeRunning ? .expiredClaudeRunning
+            : !renewAllowed ? .expiredRenewOff : isCopy ? .signedOut : .expiredRenewFailed
 
-        if creds.expiresSoon {
-            guard canRenew else { out.issue = expiredIssue; return out }
+        func renewNow() async -> Bool {
             switch await renew(item, creds) {
             case .ok(let c, let saved):
                 creds = c
-                renewed = true
+                out.fingerprint = c.fingerprint
                 if !saved { out.issue = .renewNotSaved }
+                return true
             case .failed(let issue):
-                out.issue = issue
-                return out
+                out.issue = issue == .expiredRenewFailed ? expiredIssue : issue
+                return false
             }
         }
 
-        var result = await API.usage(token: creds.accessToken)
-        if case .failure(.unauthorized) = result, !renewed, canRenew {
-            switch await renew(item, creds) {
-            case .ok(let c, let saved):
-                creds = c
-                if !saved { out.issue = .renewNotSaved }
-                result = await API.usage(token: c.accessToken)
-            case .failed(let issue):
-                out.issue = issue
+        if creds.expiresSoon {
+            guard canRenew else {
+                if case .slot(let slot, _) = source, out.identity == nil { out.identity = Discovery.identity(slot.globalConfig) }
+                out.issue = expiredIssue
                 return out
             }
+            guard await renewNow() else { return out }
+        }
+
+        // A new token (a /login, or a renewal) means asking again whose it is, and saving
+        // a copy so the account can still be tracked after Claude Code switches away from it.
+        if case .slot = source, out.identity == nil || out.fingerprint != known?.fingerprint {
+            guard let identity = await API.identity(token: creds.accessToken) else {
+                out.identity = nil
+                if out.issue == nil { out.issue = .offline }
+                return out
+            }
+            out.identity = identity
+            if keepCopy { _ = Keychain.write(Keychain.copyItem(identity.key), ["claudeAiOauth": creds.dictionary]) }
+        }
+
+        var result = await API.usage(token: creds.accessToken)
+        if case .failure(.unauthorized) = result, canRenew, await renewNow() {
+            result = await API.usage(token: creds.accessToken)
         }
 
         switch result {
         case .success(let data):
             do { out.usage = try UsageParser.parse(data) } catch { out.issue = .unreadable }
         case .failure(.unauthorized):
-            out.issue = expiredIssue
+            if out.issue == nil { out.issue = expiredIssue }
         case .failure(.rateLimited(let after)):
             out.issue = .rateLimited
             out.retryAfter = after
         case .failure:
             out.issue = .offline
         }
-        if wantEmail, out.usage != nil { out.email = await API.email(token: creds.accessToken) }
         return out
     }
 
